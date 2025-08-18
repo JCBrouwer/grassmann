@@ -1,8 +1,8 @@
-import torch
-import numpy as np
-import scipy as scp
 import itertools
 
+import numpy as np
+import scipy as scp
+import torch
 
 """
 utils to check sigma etc.
@@ -43,19 +43,15 @@ def check_valid_sigma(sigma, return_dets=False):
     """
     checks if (sigma**-1 - I) is a P0 matrix
     """
-    test = check_p0(
-        torch.inverse(sigma) - torch.eye(sigma.shape[0]), return_dets=return_dets
-    )
+    test = check_p0(torch.inverse(sigma) - torch.eye(sigma.shape[0]), return_dets=return_dets)
     return test
 
 
 # define sigma from Takashi, for testing purposes
-_sigma = torch.tensor(
-    [
-        [0.85, -0.34, -0.07, 0.16, -0.06],
-        [-0.11, 0.46, 0.06, -0.09, -0.05],
-        [-0.16, -0.42, 0.74, 0.66, -0.28],
-        [0.01, -0.08, -0.13, 0.70, -0.30],
-        [0.02, 0.15, -0.04, 0.23, 0.80],
-    ]
-)
+_sigma = torch.tensor([
+    [0.85, -0.34, -0.07, 0.16, -0.06],
+    [-0.11, 0.46, 0.06, -0.09, -0.05],
+    [-0.16, -0.42, 0.74, 0.66, -0.28],
+    [0.01, -0.08, -0.13, 0.70, -0.30],
+    [0.02, 0.15, -0.04, 0.23, 0.80],
+])

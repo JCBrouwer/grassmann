@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -45,9 +45,7 @@ class GrassmannConditional(nn.Module):
         # Modules
         self._hidden_net = hidden_net
 
-        self._logits_layer = nn.Linear(
-            hidden_features, num_components
-        )  # unnormalized mixing coefficients
+        self._logits_layer = nn.Linear(hidden_features, num_components)  # unnormalized mixing coefficients
 
         self._BC_layer = nn.Linear(
             hidden_features, num_components * 2 * features**2
@@ -67,9 +65,7 @@ class GrassmannConditional(nn.Module):
         if custom_initialization:
             self._initialize()
 
-    def get_grassmann_params(
-        self, context: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_grassmann_params(self, context: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Return logits, and sigma
         Args:
             context: Input to the MDN, leading dimension is batch dimension.
@@ -86,9 +82,7 @@ class GrassmannConditional(nn.Module):
         # apply softmax to get normalized mixing coeffiecients
         mixing_p = torch.softmax(logits, 1)
 
-        BC = self._BC_layer(h).view(
-            -1, self._num_components, 2, self._features, self._features
-        )
+        BC = self._BC_layer(h).view(-1, self._num_components, 2, self._features, self._features)
 
         sigma = self.compute_sigma(BC[:, :, 0, :, :], BC[:, :, 1, :, :])
 
@@ -100,9 +94,7 @@ class GrassmannConditional(nn.Module):
         """
         mixing_p, sigma = self.get_grassmann_params(context)
 
-        return torch.sum(
-            torch.diagonal(sigma, dim1=-1, dim2=-2) * mixing_p.unsqueeze(-1), -2
-        )
+        return torch.sum(torch.diagonal(sigma, dim1=-1, dim2=-2) * mixing_p.unsqueeze(-1), -2)
 
     def cov(self, context: Tensor) -> Tensor:
         """
@@ -132,9 +124,7 @@ class GrassmannConditional(nn.Module):
         assert sigma.shape[0] == batch_size
         assert sigma.shape[1] == n_comp
         # check if mixing coefficients sum up to 1
-        assert torch.all(
-            torch.isclose(torch.sum(mixing_p, 1), torch.ones(1), atol=1e-4)
-        )
+        assert torch.all(torch.isclose(torch.sum(mixing_p, 1), torch.ones(1), atol=1e-4))
 
         # compute cov per component
         # compute diag as p*(1-p)
@@ -147,18 +137,14 @@ class GrassmannConditional(nn.Module):
         cov_per_comp = cov_diag * diag_mask + cov_offdiag * (~diag_mask)
 
         # compute additional cov from different means
-        mean_of_means = torch.sum(
-            torch.diagonal(sigma, dim1=-1, dim2=-2) * mixing_p.unsqueeze(-1), -2
-        )
+        mean_of_means = torch.sum(torch.diagonal(sigma, dim1=-1, dim2=-2) * mixing_p.unsqueeze(-1), -2)
         mui_mu = mean_of_means.unsqueeze(1) - means
-        cov_of_means = torch.einsum(
-            "bni,bjn->bnij", mui_mu, mui_mu.transpose(-1, -2)
-        )  # batchwise outer product
+        cov_of_means = torch.einsum("bni,bjn->bnij", mui_mu, mui_mu.transpose(-1, -2))  # batchwise outer product
 
         # final weighted sum
-        cov = torch.sum(
-            cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), 1
-        ) + torch.sum(cov_of_means * mixing_p.unsqueeze(-1).unsqueeze(-1), 1)
+        cov = torch.sum(cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), 1) + torch.sum(
+            cov_of_means * mixing_p.unsqueeze(-1).unsqueeze(-1), 1
+        )
 
         return cov
 
@@ -207,33 +193,17 @@ class GrassmannConditional(nn.Module):
         num_components = B.shape[1]
 
         # apply relu to diagonal elements of B and C
-        mask = torch.ones((dim, dim)) - torch.eye((dim)).repeat(
-            batch_size, num_components, 1, 1
-        )
+        mask = torch.ones((dim, dim)) - torch.eye((dim)).repeat(batch_size, num_components, 1, 1)
         diag_mask = torch.eye(dim).repeat(batch_size, num_components, 1, 1)
 
-        B_ = B * mask + diag_mask * F.relu(
-            B * torch.eye(dim).repeat(batch_size, num_components, 1, 1)
-        )
-        C_ = C * mask + diag_mask * F.relu(
-            C * torch.eye(dim).repeat(batch_size, num_components, 1, 1)
-        )
+        B_ = B * mask + diag_mask * F.relu(B * torch.eye(dim).repeat(batch_size, num_components, 1, 1))
+        C_ = C * mask + diag_mask * F.relu(C * torch.eye(dim).repeat(batch_size, num_components, 1, 1))
 
         # make it row diagonal dominant
-        B_ = (
-            B_
-            + torch.diag_embed(torch.sum(torch.abs(B_), -1) + self._epsilon)
-            - B_ * diag_mask
-        )
-        C_ = (
-            C_
-            + torch.diag_embed(torch.sum(torch.abs(C_), -1) + self._epsilon)
-            - C_ * diag_mask
-        )
+        B_ = B_ + torch.diag_embed(torch.sum(torch.abs(B_), -1) + self._epsilon) - B_ * diag_mask
+        C_ = C_ + torch.diag_embed(torch.sum(torch.abs(C_), -1) + self._epsilon) - C_ * diag_mask
 
-        lambd = B_ @ torch.inverse(C_) + torch.eye(dim).repeat(
-            batch_size, num_components, 1, 1
-        )  # BC**-1 + I (80)
+        lambd = B_ @ torch.inverse(C_) + torch.eye(dim).repeat(batch_size, num_components, 1, 1)  # BC**-1 + I (80)
 
         sigma = torch.inverse(lambd)
 
@@ -295,19 +265,12 @@ class GrassmannConditional(nn.Module):
 
         diag_mask = torch.eye(dim).repeat(batch_size, num_components, 1, 1)
 
-        m = sigmas * ((-1) ** (1 - inputs)).repeat(1, num_components * dim).view(
-            batch_size, num_components, dim, dim
-        )
+        m = sigmas * ((-1) ** (1 - inputs)).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
         m = m * (1 - diag_mask)  # replace diag with 0
         m = m + (
-            (diag_mask * sigmas)
-            ** inputs.repeat(1, num_components * dim).view(
-                batch_size, num_components, dim, dim
-            )
+            (diag_mask * sigmas) ** inputs.repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
             * (diag_mask * (1 - sigmas))
-            ** (1 - inputs)
-            .repeat(1, num_components * dim)
-            .view(batch_size, num_components, dim, dim)
+            ** (1 - inputs).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
         )
 
         p = (mixing_p * torch.det(m)).sum(-1)
@@ -332,9 +295,7 @@ class GrassmannConditional(nn.Module):
 
         # Get necessary quantities.
         mixing_p, sigmas = self.get_grassmann_params(context)
-        return self.sample_mograssmann(
-            num_samples, mixing_p.squeeze(0), sigmas.squeeze(0)
-        )
+        return self.sample_mograssmann(num_samples, mixing_p.squeeze(0), sigmas.squeeze(0))
 
     @staticmethod
     def conditional_sigma(sigma: Tensor, xc: Tensor) -> Tensor:
@@ -363,8 +324,7 @@ class GrassmannConditional(nn.Module):
                 sigma[~mask][:, ~mask]  # sigma RR
                 - sigma[~mask][:, mask]  # sigma RC
                 @ torch.inverse(
-                    sigma[mask][:, mask]
-                    - (torch.eye(dim_c) * (1 - xc[i][mask]))  # sigma CC
+                    sigma[mask][:, mask] - (torch.eye(dim_c) * (1 - xc[i][mask]))  # sigma CC
                 )
                 @ sigma[mask][:, ~mask]  # sigma CR
             )
@@ -403,18 +363,14 @@ class GrassmannConditional(nn.Module):
         for j, n in enumerate(ns):
             if n > 0:
                 # sample first dim. simple bernoulli from sigma_00
-                samples[count : count + n, 0] = torch.bernoulli(
-                    sigma[j][0, 0].repeat(n)
-                )
+                samples[count : count + n, 0] = torch.bernoulli(sigma[j][0, 0].repeat(n))
 
                 # test code to store conditional probabilities
                 # ps = torch.zeros((num_samples, self.dim)) * torch.nan
                 # ps[:,0] = self.sigma[0,0].repeat(num_samples)
 
                 for i in range(1, dim):
-                    sigma_c = GrassmannConditional.conditional_sigma(
-                        sigma[j], samples[count : count + n]
-                    )
+                    sigma_c = GrassmannConditional.conditional_sigma(sigma[j], samples[count : count + n])
                     # clip for rounding reasons:
                     _p = sigma_c[:, 0, 0]
                     _p[_p > 1] = 1
@@ -447,9 +403,7 @@ class GrassmannConditional(nn.Module):
         raise NotImplementedError
 
         # Initialize mixture coefficients to near uniform.
-        self._logits_layer.weight.data = self._epsilon * torch.randn(
-            self._num_components, self._hidden_features
-        )
+        self._logits_layer.weight.data = self._epsilon * torch.randn(self._num_components, self._hidden_features)
         self._logits_layer.bias.data = self._epsilon * torch.randn(self._num_components)
 
         # Initialize diagonal of precision factors to inverse of softplus at 1.
@@ -458,9 +412,7 @@ class GrassmannConditional(nn.Module):
         )
         self._unconstrained_diagonal_layer.bias.data = torch.log(
             torch.exp(torch.tensor([1 - self._epsilon])) - 1
-        ) * torch.ones(
-            self._num_components * self._features
-        ) + self._epsilon * torch.randn(
+        ) * torch.ones(self._num_components * self._features) + self._epsilon * torch.randn(
             self._num_components * self._features
         )
 
@@ -468,9 +420,7 @@ class GrassmannConditional(nn.Module):
         self._upper_layer.weight.data = self._epsilon * torch.randn(
             self._num_components * self._num_upper_params, self._hidden_features
         )
-        self._upper_layer.bias.data = self._epsilon * torch.randn(
-            self._num_components * self._num_upper_params
-        )
+        self._upper_layer.bias.data = self._epsilon * torch.randn(self._num_components * self._num_upper_params)
 
 
 class hidden_fc_net(nn.Module):

@@ -1,15 +1,8 @@
-import torch
-from torch import nn, Tensor
-from torch.nn import functional as F
-from torch.optim import Adam
-
-import warnings
-import scipy as scp
-import scipy.optimize
 import numpy as np
-import itertools
+import torch
+from torch import Tensor
 
-from grassmann_distribution.utils import check_valid_sigma
+from grassmann.utils import check_valid_sigma
 
 
 class GrassmannBinary:
@@ -21,13 +14,13 @@ class GrassmannBinary:
     def __init__(
         self,
         sigma: Tensor,
-        lambd=None,
+        lambd: Tensor | None = None,
     ):
         assert len(sigma.shape) == 2
         assert check_valid_sigma(sigma)
         self.dim = sigma.shape[0]
         self.sigma = sigma
-        if lambd == None:
+        if lambd is None:
             self.lambd = torch.inverse(sigma)  # this is not used at the moment!
         self._epsilon = 1e-4  # small value to avoid singular matrices
 
@@ -57,20 +50,12 @@ class GrassmannBinary:
         m = torch.zeros((batch_size, dim, dim))
 
         # vectorized version
-        m = sigma.repeat(batch_size, 1, 1) * ((-1) ** (1 - x)).repeat(1, dim).view(
-            batch_size, dim, dim
-        )
-        m = m * (
-            1 - torch.eye(dim, dim).repeat(batch_size, 1, 1)
-        )  # replace diag with 0
+        m = sigma.repeat(batch_size, 1, 1) * ((-1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
+        m = m * (1 - torch.eye(dim, dim).repeat(batch_size, 1, 1))  # replace diag with 0
         m = m + (
             torch.eye(dim).repeat(batch_size, 1, 1)
-            * (torch.diag(sigma).repeat(batch_size, 1) ** x)
-            .repeat(1, dim)
-            .view(batch_size, dim, dim)
-            * (torch.diag(1 - sigma).repeat(batch_size, 1) ** (1 - x))
-            .repeat(1, dim)
-            .view(batch_size, dim, dim)
+            * (torch.diag(sigma).repeat(batch_size, 1) ** x).repeat(1, dim).view(batch_size, dim, dim)
+            * (torch.diag(1 - sigma).repeat(batch_size, 1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
         )
 
         # looped version
@@ -270,19 +255,12 @@ class MoGrassmannBinary:
 
         diag_mask = torch.eye(dim).repeat(batch_size, num_components, 1, 1)
 
-        m = sigmas * ((-1) ** (1 - inputs)).repeat(1, num_components * dim).view(
-            batch_size, num_components, dim, dim
-        )
+        m = sigmas * ((-1) ** (1 - inputs)).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
         m = m * (1 - diag_mask)  # replace diag with 0
         m = m + (
-            (diag_mask * sigmas)
-            ** inputs.repeat(1, num_components * dim).view(
-                batch_size, num_components, dim, dim
-            )
+            (diag_mask * sigmas) ** inputs.repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
             * (diag_mask * (1 - sigmas))
-            ** (1 - inputs)
-            .repeat(1, num_components * dim)
-            .view(batch_size, num_components, dim, dim)
+            ** (1 - inputs).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
         )
 
         p = (mixing_p * torch.det(m)).sum(-1)
@@ -326,17 +304,13 @@ class MoGrassmannBinary:
         cov_per_comp = cov_diag * diag_mask + cov_offdiag * (~diag_mask)
 
         # compute additional cov from different means
-        mean_of_means = torch.sum(
-            (torch.diagonal(sigma, dim1=-1, dim2=-2).T * mixing_p).T, -2
-        )
+        mean_of_means = torch.sum((torch.diagonal(sigma, dim1=-1, dim2=-2).T * mixing_p).T, -2)
         mui_mu = mean_of_means - means
-        cov_of_means = torch.einsum(
-            "ni,jn->nij", mui_mu, mui_mu.transpose(-1, -2)
-        )  # batchwise outer product
+        cov_of_means = torch.einsum("ni,jn->nij", mui_mu, mui_mu.transpose(-1, -2))  # batchwise outer product
         # final weighted sum
-        cov = torch.sum(
-            cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), 0
-        ) + torch.sum(cov_of_means * mixing_p.unsqueeze(-1).unsqueeze(-1), 0)
+        cov = torch.sum(cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), 0) + torch.sum(
+            cov_of_means * mixing_p.unsqueeze(-1).unsqueeze(-1), 0
+        )
 
         return cov
 
@@ -432,18 +406,14 @@ class MoGrassmannBinary:
         for j, n in enumerate(ns):
             if n > 0:
                 # sample first dim. simple bernoulli from sigma_00
-                samples[count : count + n, 0] = torch.bernoulli(
-                    self.sigma[j][0, 0].repeat(n)
-                )
+                samples[count : count + n, 0] = torch.bernoulli(self.sigma[j][0, 0].repeat(n))
 
                 # test code to store conditional probabilities
                 # ps = torch.zeros((num_samples, self.dim)) * torch.nan
                 # ps[:,0] = self.sigma[0,0].repeat(num_samples)
 
                 for i in range(1, self.dim):
-                    sigma_c = self.conditional_sigma(
-                        self.sigma[j], samples[count : count + n]
-                    )
+                    sigma_c = self.conditional_sigma(self.sigma[j], samples[count : count + n])
                     samples[count : count + n, i] = torch.bernoulli(sigma_c[:, 0, 0])
 
                     """

@@ -1,15 +1,14 @@
+import warnings
+
+import numpy as np
+import scipy as scp
+import scipy.optimize
 import torch
-from torch import nn, Tensor
+from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.optim import Adam
 
-import warnings
-import scipy as scp
-import scipy.optimize
-import numpy as np
-import itertools
-
-from grassmann_distribution.utils import check_valid_sigma
+from grassmann.utils import check_valid_sigma
 
 """
 Estimating classes
@@ -44,17 +43,11 @@ class EstimateGrassmannMomentMatching:
 
         if not (check_valid_sigma(sigma)):  # checks if the cov gives a valid sigma
             if verbose:
-                print(
-                    "Sampling covariance returns no valid sigma initialization. Trying downscaling."
-                )
-            warnings.warn(
-                "Sampling covariance returns no valid sigma . Trying downscaling. "
-            )
+                print("Sampling covariance returns no valid sigma initialization. Trying downscaling.")
+            warnings.warn("Sampling covariance returns no valid sigma . Trying downscaling. ")
             mask = torch.ones((self.dim, self.dim)) - torch.eye((self.dim))
             for scale in np.arange(0, 1, 0.02):
-                sigma = (
-                    sigma - sigma * mask * scale
-                )  # *torch.rand((self.dim, self.dim))
+                sigma = sigma - sigma * mask * scale  # *torch.rand((self.dim, self.dim))
                 if verbose:
                     print("determinants: ", check_valid_sigma(sigma, return_dets=True))
 
@@ -63,12 +56,8 @@ class EstimateGrassmannMomentMatching:
                         print(f"downscaling cov with {scale} helps.")
                     break
 
-            if not (
-                check_valid_sigma(sigma)
-            ):  # checks if the sampling cov gives a valid sigma
-                warnings.warn(
-                    "No valid sigma found. Check if you really want to use the Grassmann framework!"
-                )
+            if not (check_valid_sigma(sigma)):  # checks if the sampling cov gives a valid sigma
+                warnings.warn("No valid sigma found. Check if you really want to use the Grassmann framework!")
                 return None
 
         self.sigma = sigma
@@ -92,20 +81,20 @@ class EstimateGrassmann(nn.Module):
     ):
         """multi-layer NN
         Args:
-            dim: Dimensionality of the input: 
+            dim: Dimensionality of the input:
             num_hiddens: Number of hidden units in fully connected layer
         """
         super().__init__()
         self.dim = dim
         self.verbose = verbose
 
-        if init_on_samples and not (samples_init == None):
+        if init_on_samples and samples_init is not None:
             B_init, C_init = self.get_initial_BC(samples_init)
 
         # initialize parameters for grassmann
-        if B_init == None:
+        if B_init is None:
             B_init = torch.randn((self.dim, self.dim))
-        if C_init == None:
+        if C_init is None:
             C_init = torch.randn((self.dim, self.dim))
 
         self.B = torch.nn.Parameter(data=B_init, requires_grad=True)
@@ -131,9 +120,7 @@ class EstimateGrassmann(nn.Module):
                 sigma_init[i, j] = torch.abs(sample_cov[i, j]) ** 0.5
                 sigma_init[j, i] = -sigma_init[i, j] * torch.sign(sample_cov)[i, j]
 
-        if not (
-            check_valid_sigma(sigma_init)
-        ):  # checks if the sampling cov gives a valid sigma
+        if not (check_valid_sigma(sigma_init)):  # checks if the sampling cov gives a valid sigma
             if self.verbose:
                 print(
                     "Sampling covariance returns no valid sigma initialization. Trying downscaling and adding some noise."
@@ -144,20 +131,15 @@ class EstimateGrassmann(nn.Module):
             mask = torch.ones((self.dim, self.dim)) - torch.eye((self.dim))
             for scale in [0.95, 0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4, 0.4, 0.3, 0.2, 0.1]:
                 sigma_init = (
-                    sigma_init * torch.eye((self.dim))
-                    + sigma_init * mask * torch.rand((self.dim, self.dim)) * scale
+                    sigma_init * torch.eye((self.dim)) + sigma_init * mask * torch.rand((self.dim, self.dim)) * scale
                 )
                 if check_valid_sigma(sigma_init):
                     if self.verbose:
                         print(f"downscaling cov with {scale} helps.")
                     break
 
-            if not (
-                check_valid_sigma(sigma_init)
-            ):  # checks if the sampling cov gives a valid sigma
-                warnings.warn(
-                    "B,C got randomly initialized. Check if you really want to use the Grassmann framework!"
-                )
+            if not (check_valid_sigma(sigma_init)):  # checks if the sampling cov gives a valid sigma
+                warnings.warn("B,C got randomly initialized. Check if you really want to use the Grassmann framework!")
                 return None, None
 
         BC_init = np.array(torch.rand((1, 2 * self.dim * self.dim)))
@@ -205,7 +187,11 @@ class EstimateGrassmann(nn.Module):
 
         return sigma
 
-    def prob_grassmann(self, x: Tensor, sigma: Tensor,) -> Tensor:  # n x d  # (d x d)
+    def prob_grassmann(
+        self,
+        x: Tensor,
+        sigma: Tensor,
+    ) -> Tensor:  # n x d  # (d x d)
         """
         Return the probability of `x` under a GrassmannBinary with specified parameters.
         Args:
@@ -222,20 +208,12 @@ class EstimateGrassmann(nn.Module):
         m = torch.zeros((batch_size, dim, dim))
 
         # vectorized version
-        m = sigma.repeat(batch_size, 1, 1) * ((-1) ** (1 - x)).repeat(1, dim).view(
-            batch_size, dim, dim
-        )
-        m = m * (
-            1 - torch.eye(dim, dim).repeat(batch_size, 1, 1)
-        )  # replace diag with 0
+        m = sigma.repeat(batch_size, 1, 1) * ((-1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
+        m = m * (1 - torch.eye(dim, dim).repeat(batch_size, 1, 1))  # replace diag with 0
         m = m + (
             torch.eye(dim).repeat(batch_size, 1, 1)
-            * (torch.diag(sigma).repeat(batch_size, 1) ** x)
-            .repeat(1, dim)
-            .view(batch_size, dim, dim)
-            * (torch.diag(1 - sigma).repeat(batch_size, 1) ** (1 - x))
-            .repeat(1, dim)
-            .view(batch_size, dim, dim)
+            * (torch.diag(sigma).repeat(batch_size, 1) ** x).repeat(1, dim).view(batch_size, dim, dim)
+            * (torch.diag(1 - sigma).repeat(batch_size, 1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
         )
 
         p = torch.det(m)
@@ -278,7 +256,7 @@ class EstimateMoGrassmann(nn.Module):
     ):
         """multi-layer NN
         Args:
-            dim: Dimensionality of the input: 
+            dim: Dimensionality of the input:
             nc: number of components
             num_hiddens: Number of hidden units in fully connected layer
         """
@@ -292,7 +270,7 @@ class EstimateMoGrassmann(nn.Module):
         C_init = torch.randn((self.nc, self.dim, self.dim))
         p_mixing_init = torch.rand(self.nc)
 
-        if init_on_samples and not (samples_init == None):
+        if init_on_samples and samples_init is not None:
             B_init1, C_init1 = self.get_initial_BC(samples_init)
             for i in range(nc):
                 B_init[i] = B_init1 + torch.randn((self.dim, self.dim)) * 1e-10
@@ -325,9 +303,7 @@ class EstimateMoGrassmann(nn.Module):
                 sigma_init[i, j] = torch.abs(sample_cov[i, j]) ** 0.5
                 sigma_init[j, i] = -sigma_init[i, j] * torch.sign(sample_cov)[i, j]
 
-        if not (
-            check_valid_sigma(sigma_init)
-        ):  # checks if the sampling cov gives a valid sigma
+        if not (check_valid_sigma(sigma_init)):  # checks if the sampling cov gives a valid sigma
             if self.verbose:
                 print(
                     "Sampling covariance returns no valid sigma initialization. Trying downscaling and adding some noise."
@@ -338,20 +314,15 @@ class EstimateMoGrassmann(nn.Module):
             mask = torch.ones((self.dim, self.dim)) - torch.eye((self.dim))
             for scale in [0.95, 0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4, 0.4, 0.3, 0.2, 0.1]:
                 sigma_init = (
-                    sigma_init * torch.eye((self.dim))
-                    + sigma_init * mask * torch.rand((self.dim, self.dim)) * scale
+                    sigma_init * torch.eye((self.dim)) + sigma_init * mask * torch.rand((self.dim, self.dim)) * scale
                 )
                 if check_valid_sigma(sigma_init):
                     if self.verbose:
                         print(f"downscaling cov with {scale} helps.")
                     break
 
-            if not (
-                check_valid_sigma(sigma_init)
-            ):  # checks if the sampling cov gives a valid sigma
-                warnings.warn(
-                    "B,C got randomly initialized. Check if you really want to use the Grassmann framework!"
-                )
+            if not (check_valid_sigma(sigma_init)):  # checks if the sampling cov gives a valid sigma
+                warnings.warn("B,C got randomly initialized. Check if you really want to use the Grassmann framework!")
                 return None, None
 
         BC_init = np.array(torch.rand((1, 2 * self.dim * self.dim)))
@@ -405,18 +376,12 @@ class EstimateMoGrassmann(nn.Module):
         for i in range(self.nc):
             # apply relu to diagonal elements of B and C
             mask = torch.ones((self.dim, self.dim)) - torch.eye((self.dim))
-            B_ = B[i] * mask + torch.eye(self.dim) * F.relu(
-                torch.diag(B[i])
-            )  # torch.exp
+            B_ = B[i] * mask + torch.eye(self.dim) * F.relu(torch.diag(B[i]))  # torch.exp
             C_ = C[i] * mask + torch.eye(self.dim) * F.relu(torch.diag(C[i]))
 
             # make it row diagonal dominant
-            B_ = B_ + torch.eye(self.dim) * (
-                torch.sum(torch.abs(B_), 1) - torch.diag(B_)
-            )
-            C_ = C_ + torch.eye(self.dim) * (
-                torch.sum(torch.abs(C_), 1) - torch.diag(C_)
-            )
+            B_ = B_ + torch.eye(self.dim) * (torch.sum(torch.abs(B_), 1) - torch.diag(B_))
+            C_ = C_ + torch.eye(self.dim) * (torch.sum(torch.abs(C_), 1) - torch.diag(C_))
 
             lambd = B_ @ torch.inverse(C_) + torch.eye(self.dim)  # BC**-1 + I (80)
 
@@ -425,7 +390,10 @@ class EstimateMoGrassmann(nn.Module):
         return sigma
 
     def prob_mograssmann(
-        self, x: Tensor, sigma: Tensor, p_mixing: Tensor  # n x d  # (nc, d x d)  # (nc)
+        self,
+        x: Tensor,
+        sigma: Tensor,
+        p_mixing: Tensor,  # n x d  # (nc, d x d)  # (nc)
     ) -> Tensor:
         """
         Return the probability of `x` under a GrassmannBinary with specified parameters.
@@ -444,19 +412,12 @@ class EstimateMoGrassmann(nn.Module):
 
         diag_mask = torch.eye(dim).repeat(batch_size, num_components, 1, 1)
 
-        m = sigma * ((-1) ** (1 - x)).repeat(1, num_components * dim).view(
-            batch_size, num_components, dim, dim
-        )
+        m = sigma * ((-1) ** (1 - x)).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
         m = m * (1 - diag_mask)  # replace diag with 0
         m = m + (
-            (diag_mask * sigma)
-            ** x.repeat(1, num_components * dim).view(
-                batch_size, num_components, dim, dim
-            )
+            (diag_mask * sigma) ** x.repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
             * (diag_mask * (1 - sigma))
-            ** (1 - x)
-            .repeat(1, num_components * dim)
-            .view(batch_size, num_components, dim, dim)
+            ** (1 - x).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
         )
 
         p = (p_mixing * torch.det(m)).sum(-1)
@@ -510,7 +471,6 @@ def train_EstimateGrassmann(
     if verbose:
         print("Started training...")
     for step in range(steps):
-
         # get the inputs; data is a list of [inputs, labels]
         # _x = gr.sample_grassmann(200)
         # _x = samples[i*200:(i+1)*200]
@@ -533,9 +493,7 @@ def train_EstimateGrassmann(
 
         if clip_gradient:
             # clip gradient of params
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 0.1, error_if_nonfinite=True
-            )
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1, error_if_nonfinite=True)
 
         optimizer.step()
 
@@ -545,9 +503,7 @@ def train_EstimateGrassmann(
 
         if verbose:
             if step % 100 == 1:
-                print(
-                    f"""step [{step}] loss: {torch.mean(loss_stored[(step-99):step]):.3f} """
-                )
+                print(f"""step [{step}] loss: {torch.mean(loss_stored[(step - 99) : step]):.3f} """)
 
         if early_stop and step > 200:
             loss_new = torch.mean(loss_stored[(step - 99) : step])
