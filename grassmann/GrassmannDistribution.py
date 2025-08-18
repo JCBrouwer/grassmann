@@ -58,12 +58,6 @@ class GrassmannBinary:
             * (torch.diag(1 - sigma).repeat(batch_size, 1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
         )
 
-        # looped version
-        # for i in range(batch_size):
-        #    m[i] = sigma* (-1)**(1-x[i])
-        #    m[i].fill_diagonal_(0)
-        #    m[i] = m[i] + torch.eye(dim) * torch.diag(sigma)**x[i] * torch.diag(1-sigma)**(1-x[i])
-
         p = torch.det(m)
 
         return p
@@ -72,7 +66,7 @@ class GrassmannBinary:
         """
         returns the expected value based on self.sigma
         """
-        return torch.diagonal(self.sigma, dim1=0, dim2=1)
+        return torch.diagonal(self.sigma)
 
     @staticmethod
     def cov_grassmann(sigma):
@@ -84,25 +78,18 @@ class GrassmannBinary:
         Returns:
             Tensor: cov
         """
-        cov = torch.zeros(sigma.shape)
-        dim = sigma.shape[-1]
-        for i in range(dim):
-            for j in range(i + 1):
-                if i == j:
-                    cov[i, i] = sigma[i, i] * (1 - sigma[i, i])
-                else:
-                    cov[i, j] = -sigma[i, j] * sigma[j, i]
-                    cov[j, i] = cov[i, j]
-
+        # off-diagonal: -sigma_ij * sigma_ji
+        cov = -(sigma * sigma.T)
+        # diagonal: p * (1 - p), where p = diag(sigma)
+        diag = torch.diagonal(sigma)
+        cov.diagonal().copy_(diag * (1 - diag))
         return cov
 
     def cov(self):
         """
         returns covariance matrix based on self.sigma
         """
-        cov = GrassmannBinary.cov_grassmann(self.sigma)
-
-        return cov
+        return GrassmannBinary.cov_grassmann(self.sigma)
 
     def corr(self):
         """
@@ -111,42 +98,90 @@ class GrassmannBinary:
         cov = self.cov()
         std = torch.sqrt(torch.diag(cov))
         std_mat = torch.outer(std, std)
-
         return cov / (std_mat + 1e-8)
+
+    @staticmethod
+    def conditional_sigma_from(sigma: Tensor, xc: Tensor, epsilon: float) -> Tensor:
+        """
+        Vectorized conditional sigma computation given a sigma and batch of partially observed xc.
+        xc contains NaNs for unobserved entries.
+        Returns a batch of conditional sigmas for the remaining (unobserved) dimensions.
+        """
+        batch_size, _ = xc.shape
+        dim = sigma.shape[0]
+
+        dim_r_per_row = torch.isnan(xc).sum(1)
+        assert torch.all(torch.eq(dim_r_per_row, dim_r_per_row[0]))
+        dim_r = int(dim_r_per_row[0].item())
+        dim_c = dim - dim_r
+
+        device = sigma.device
+        dtype = sigma.dtype
+
+        sigma_r = torch.empty((batch_size, dim_r, dim_r), dtype=dtype, device=device)
+        masks = ~torch.isnan(xc)
+
+        # Fast path: identical masks across batch
+        if torch.all(masks[0] == masks):
+            mask = masks[0]
+            remaining_mask = ~mask
+
+            if dim_c == 0:
+                sigma_rr = sigma[remaining_mask][:, remaining_mask]
+                sigma_r[:] = sigma_rr
+                return sigma_r
+
+            sigma_rr = sigma[remaining_mask][:, remaining_mask]
+            sigma_rc = sigma[remaining_mask][:, mask]
+            sigma_cr = sigma[mask][:, remaining_mask]
+            sigma_cc = sigma[mask][:, mask]
+
+            x_c = xc[:, mask]
+            eye_c = torch.eye(dim_c, dtype=dtype, device=device)
+            A = sigma_cc.expand(batch_size, dim_c, dim_c).clone()
+            A = A - torch.diag_embed(1 - x_c) + eye_c * epsilon
+            B = sigma_cr.expand(batch_size, dim_c, dim_r)
+            X = torch.linalg.solve(A, B)
+            sigma_r[:] = sigma_rr - torch.matmul(sigma_rc, X)
+            return sigma_r
+
+        # General path: group by unique masks
+        unique_masks, inverse_indices = torch.unique(masks, dim=0, return_inverse=True)
+        for group_index in range(unique_masks.shape[0]):
+            row_selector = inverse_indices == group_index
+            if not torch.any(row_selector):
+                continue
+
+            mask = unique_masks[group_index]
+            remaining_mask = ~mask
+
+            if dim_c == 0:
+                sigma_rr = sigma[remaining_mask][:, remaining_mask]
+                sigma_r[row_selector] = sigma_rr
+                continue
+
+            sigma_rr = sigma[remaining_mask][:, remaining_mask]
+            sigma_rc = sigma[remaining_mask][:, mask]
+            sigma_cr = sigma[mask][:, remaining_mask]
+            sigma_cc = sigma[mask][:, mask]
+
+            x_c = xc[row_selector][:, mask]
+            n_g = x_c.shape[0]
+            eye_c = torch.eye(dim_c, dtype=dtype, device=device)
+            A = sigma_cc.expand(n_g, dim_c, dim_c).clone()
+            A = A - torch.diag_embed(1 - x_c) + eye_c * epsilon
+            B = sigma_cr.expand(n_g, dim_c, dim_r)
+            X = torch.linalg.solve(A, B)
+            sigma_r[row_selector] = sigma_rr - torch.matmul(sigma_rc, X)
+
+        return sigma_r
 
     def conditional_sigma(self, xc: Tensor) -> Tensor:
         """
         returns the conditional grassmann matrix for the remaining dimensions, given xc
             xc: Tensor of full dim, with "nan" in remaining positions. (batch_size x d)
         """
-        batch_size = xc.shape[0]
-
-        # number of remaining dimensions should be all the same for one batch
-        dim_r = (torch.isnan(xc)).sum(1)  # nan if unconditioned
-        assert torch.all(torch.torch.eq(dim_r, dim_r[0]))
-        dim_r = dim_r[0]
-        dim_c = self.dim - dim_r
-
-        sigma_r = torch.zeros((batch_size, dim_r, dim_r))
-
-        # todo: make more efficient by dealing with 0 and 1 differently? split up sigma CC?
-        # see paper for details.
-
-        for i in range(batch_size):
-            mask = ~torch.isnan(xc[i])  # True if conditioned
-
-            sigma_r[i] = (
-                self.sigma[~mask][:, ~mask]  # sigma RR
-                - self.sigma[~mask][:, mask]  # sigma RC
-                @ torch.inverse(
-                    self.sigma[mask][:, mask]  # sigma CC
-                    - (torch.eye(dim_c) * (1 - xc[i][mask]))
-                    + torch.eye(dim_c) * self._epsilon
-                )
-                @ self.sigma[mask][:, ~mask]  # sigma CR
-            )
-
-        return sigma_r
+        return GrassmannBinary.conditional_sigma_from(self.sigma, xc, self._epsilon)
 
     def sample(
         self,
@@ -163,31 +198,13 @@ class GrassmannBinary:
         samples = torch.zeros((num_samples, self.dim)) * torch.nan
 
         # sample first dim. simple bernoulli from sigma_00
-        samples[:, 0] = torch.bernoulli(self.sigma[0, 0].repeat(num_samples))
-
-        # test code to store conditional probabilities
-        # ps = torch.zeros((num_samples, self.dim)) * torch.nan
-        # ps[:,0] = self.sigma[0,0].repeat(num_samples)
+        samples[:, 0] = torch.bernoulli(self.sigma[0, 0].expand(num_samples))
 
         for i in range(1, self.dim):
             sigma_c = self.conditional_sigma(samples)
             samples[:, i] = torch.bernoulli(sigma_c[:, 0, 0])
 
-            """
-            ### code for testing for invalid ps
-            ps[:,i] = sigma_c[:,0,0]
-            try:
-                samples[:,i] = torch.bernoulli(sigma_c[:,0,0])
-            except:
-                for j in range(num_samples):
-                    try:
-                        samples[j,i] = torch.bernoulli(sigma_c[j,0,0])
-                    except:
-                        samples[j,i] = 1.
-             ###
-             """
-
-        return samples  # ,ps
+        return samples
 
 
 """
@@ -249,23 +266,12 @@ class MoGrassmannBinary:
         assert len(inputs.shape) == 2  # check dim: batch, dim
         assert sigmas.shape[0] == mixing_p.shape[0]  # check: n_components
 
-        batch_size = inputs.shape[0]
-        dim = inputs.shape[-1]
         num_components = mixing_p.shape[0]
 
-        diag_mask = torch.eye(dim).repeat(batch_size, num_components, 1, 1)
-
-        m = sigmas * ((-1) ** (1 - inputs)).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
-        m = m * (1 - diag_mask)  # replace diag with 0
-        m = m + (
-            (diag_mask * sigmas) ** inputs.repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
-            * (diag_mask * (1 - sigmas))
-            ** (1 - inputs).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
-        )
-
-        p = (mixing_p * torch.det(m)).sum(-1)
-
-        return p
+        # Reuse single-component probability and sum across components
+        per_comp = [GrassmannBinary.prob_grassmann(inputs, sigmas[k]) for k in range(num_components)]
+        probs = torch.stack(per_comp, dim=-1)  # (batch_size, num_components)
+        return probs @ mixing_p
 
     def mean(self):
         """
@@ -286,33 +292,30 @@ class MoGrassmannBinary:
             cov (dim,dim)
         """
         # get dims
-        dim = sigma.shape[-1]
         n_comp = mixing_p.shape[-1]
 
         assert sigma.shape[0] == n_comp
         # check if mixing coefficients sum up to 1
         assert torch.isclose(torch.sum(mixing_p), torch.ones(1), atol=1e-4)
 
-        # compute cov per component
-        # compute diag as p*(1-p)
-        means = torch.diagonal(sigma, dim1=-1, dim2=-2)
-        cov_diag = torch.diag_embed(means * (1 - means))
-        # compute offdiag as -sigma_ij*sigma_ji
-        cov_offdiag = -sigma * torch.transpose(sigma, -1, -2)
-        # add these up with diag_mask
-        diag_mask = torch.eye(dim, dtype=bool).repeat(n_comp, 1, 1)
-        cov_per_comp = cov_diag * diag_mask + cov_offdiag * (~diag_mask)
+        # Means per component
+        means = torch.diagonal(sigma, dim1=-1, dim2=-2)  # (n_comp, dim)
 
-        # compute additional cov from different means
-        mean_of_means = torch.sum((torch.diagonal(sigma, dim1=-1, dim2=-2).T * mixing_p).T, -2)
-        mui_mu = mean_of_means - means
-        cov_of_means = torch.einsum("ni,jn->nij", mui_mu, mui_mu.transpose(-1, -2))  # batchwise outer product
-        # final weighted sum
-        cov = torch.sum(cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), 0) + torch.sum(
-            cov_of_means * mixing_p.unsqueeze(-1).unsqueeze(-1), 0
-        )
+        # Reuse GrassmannBinary.cov_grassmann per component
+        cov_per_comp = torch.stack(
+            [GrassmannBinary.cov_grassmann(sigma[k]) for k in range(n_comp)], dim=0
+        )  # (n_comp, dim, dim)
 
-        return cov
+        # Weighted within-component covariance
+        cov_within = torch.sum(cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), dim=0)
+
+        # Mixture mean and between-component covariance
+        mixture_mean = torch.sum(means * mixing_p.unsqueeze(-1), dim=0)  # (dim)
+        diffs = means - mixture_mean  # (n_comp, dim)
+        cov_of_means_per_comp = torch.einsum("ni,nj->nij", diffs, diffs)
+        cov_between = torch.sum(cov_of_means_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), dim=0)
+
+        return cov_within + cov_between
 
     def cov(self):
         """
@@ -353,42 +356,9 @@ class MoGrassmannBinary:
         returns the conditional grassmann matrix for the remaining dimensions, given xc
             xc: Tensor of full dim, with "nan" in remaining positions. (batch_size x d)
         """
-        batch_size = xc.shape[0]
+        return GrassmannBinary.conditional_sigma_from(sigma, xc, self._epsilon)
 
-        # number of remaining dimensions should be all the same for one batch
-        dim_r = (torch.isnan(xc)).sum(1)  # nan if unconditioned
-        assert torch.all(torch.torch.eq(dim_r, dim_r[0]))
-        dim_r = dim_r[0]
-        dim_c = self.dim - dim_r
-
-        sigma_r = torch.zeros((batch_size, dim_r, dim_r))
-
-        # todo: make more efficient by dealing with 0 and 1 differently? split up sigma CC?
-        # see paper for details.
-
-        for i in range(batch_size):
-            mask = ~torch.isnan(xc[i])  # True if conditioned
-            # linalg.solve(A, B) == linalg.inv(A) @ B
-            # https://pytorch.org/docs/stable/generated/torch.linalg.inv.html#torch.linalg.inv
-            # problem here: B = sigma CR is not a square matrix
-
-            sigma_r[i] = (
-                sigma[~mask][:, ~mask]  # sigma RR
-                - sigma[~mask][:, mask]  # sigma RC
-                @ torch.inverse(
-                    sigma[mask][:, mask]  # sigma CC
-                    - (torch.eye(dim_c) * (1 - xc[i][mask]))
-                    + torch.eye(dim_c) * self._epsilon
-                )
-                @ sigma[mask][:, ~mask]  # sigma CR
-            )
-
-        return sigma_r
-
-    def sample(
-        self,
-        num_samples: int,
-    ) -> Tensor:
+    def sample(self, num_samples: int) -> Tensor:
         """
         Return samples of a moGrassmannBinary with specified parameters.
         Args:
@@ -404,31 +374,15 @@ class MoGrassmannBinary:
 
         count = 0
         for j, n in enumerate(ns):
-            if n > 0:
+            n_int = int(n.item())
+            if n_int > 0:
                 # sample first dim. simple bernoulli from sigma_00
-                samples[count : count + n, 0] = torch.bernoulli(self.sigma[j][0, 0].repeat(n))
-
-                # test code to store conditional probabilities
-                # ps = torch.zeros((num_samples, self.dim)) * torch.nan
-                # ps[:,0] = self.sigma[0,0].repeat(num_samples)
+                samples[count : count + n_int, 0] = torch.bernoulli(self.sigma[j][0, 0].expand(n_int))
 
                 for i in range(1, self.dim):
-                    sigma_c = self.conditional_sigma(self.sigma[j], samples[count : count + n])
-                    samples[count : count + n, i] = torch.bernoulli(sigma_c[:, 0, 0])
+                    sigma_c = self.conditional_sigma(self.sigma[j], samples[count : count + n_int])
+                    samples[count : count + n_int, i] = torch.bernoulli(sigma_c[:, 0, 0])
 
-                    """
-                    ### code for testing for invalid ps
-                    ps[:,i] = sigma_c[:,0,0]
-                    try:
-                        samples[:,i] = torch.bernoulli(sigma_c[:,0,0])
-                    except:
-                        for j in range(num_samples):
-                            try:
-                                samples[j,i] = torch.bernoulli(sigma_c[j,0,0])
-                            except:
-                                samples[j,i] = 1.
-                     ###
-                     """
-            count += n
+            count += n_int
 
-        return samples[torch.randperm(num_samples)]  # ,ps
+        return samples[torch.randperm(num_samples)]
