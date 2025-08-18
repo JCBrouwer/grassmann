@@ -62,11 +62,49 @@ def test_train_estimate_grassmann_decreases_loss():
     torch.manual_seed(2)
     dim = ARAI_REFERENCE_SIGMA.shape[0]
     gb = GrassmannBinary(ARAI_REFERENCE_SIGMA)
-    samples = gb.sample(2000)
+    samples = gb.sample(1000)
 
     model = EstimateGrassmann(dim)
-    history = train_EstimateGrassmann(model, samples, steps=300, verbose=False, batch_size=256, early_stop=False)
+    history = train_EstimateGrassmann(model, samples, steps=100, verbose=False, batch_size=256, early_stop=False)
     # check last window lower than first window
     start = history[:50].mean()
     end = history[-50:].mean()
     assert end < start
+
+
+def test_estimate_grassmann_learns_reference_sigma_well_enough():
+    torch.manual_seed(3)
+    dim = ARAI_REFERENCE_SIGMA.shape[0]
+    ref = GrassmannBinary(ARAI_REFERENCE_SIGMA)
+    samples = ref.sample(5000)
+
+    # Initialize model and compute initial sigma, mean, cov
+    model = EstimateGrassmann(dim)
+    sigma_init = compute_sigma_from_BC(model.B, model.C)
+    mean_ref = torch.diagonal(ARAI_REFERENCE_SIGMA)
+    cov_ref = GrassmannBinary.cov_grassmann(ARAI_REFERENCE_SIGMA)
+    mean_init = torch.diagonal(sigma_init)
+    cov_init = GrassmannBinary.cov_grassmann(sigma_init)
+
+    diag_rmse_init = torch.sqrt(torch.mean((mean_init - mean_ref) ** 2))
+    cov_fro_init = torch.linalg.norm(cov_init - cov_ref)
+    cov_fro_ref = torch.linalg.norm(cov_ref) + 1e-8
+
+    # Train
+    train_EstimateGrassmann(model, samples, steps=1000, verbose=False, batch_size=512, early_stop=False)
+
+    # Evaluate post-training
+    sigma_trained = compute_sigma_from_BC(model.B, model.C)
+    mean_tr = torch.diagonal(sigma_trained)
+    cov_tr = GrassmannBinary.cov_grassmann(sigma_trained)
+
+    diag_rmse_tr = torch.sqrt(torch.mean((mean_tr - mean_ref) ** 2))
+    cov_fro_tr = torch.linalg.norm(cov_tr - cov_ref)
+
+    # Must improve significantly vs init
+    assert diag_rmse_tr < diag_rmse_init * 0.7, f"diag_rmse_tr: {diag_rmse_tr}, diag_rmse_init: {diag_rmse_init}"
+    assert cov_fro_tr < cov_fro_init * 0.7, f"cov_fro_tr: {cov_fro_tr}, cov_fro_init: {cov_fro_init}"
+
+    # And meet loose absolute thresholds
+    assert diag_rmse_tr < 0.2, f"diag_rmse_tr: {diag_rmse_tr}"
+    assert (cov_fro_tr / cov_fro_ref) < 0.8, f"cov_fro_tr: {cov_fro_tr}, cov_fro_ref: {cov_fro_ref}"
