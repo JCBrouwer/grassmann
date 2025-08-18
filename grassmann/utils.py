@@ -43,8 +43,7 @@ def check_valid_sigma(sigma, return_dets=False):
     """
     checks if (sigma**-1 - I) is a P0 matrix
     """
-    test = check_p0(torch.inverse(sigma) - torch.eye(sigma.shape[0]), return_dets=return_dets)
-    return test
+    return check_p0(torch.inverse(sigma) - torch.eye(sigma.shape[0]), return_dets=return_dets)
 
 
 # define sigma from Takashi, for testing purposes

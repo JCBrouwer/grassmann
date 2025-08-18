@@ -1,4 +1,5 @@
 # pip install git+https://github.com/mackelab/grassmann_binary_distribution
+import pytest
 import torch
 from grassmann_distribution.GrassmannDistribution import GrassmannBinary as ReferenceGrassmannBinary
 from grassmann_distribution.GrassmannDistribution import MoGrassmannBinary as ReferenceMoGrassmannBinary
@@ -7,10 +8,41 @@ from grassmann.GrassmannDistribution import GrassmannBinary, MoGrassmannBinary
 from grassmann.utils import ARAI_REFERENCE_SIGMA
 
 
-def test_grassmann_parity_prob_mean_cov_corr():
-    torch.manual_seed(0)
+def generate_valid_sigma(dim: int, seed: int, epsilon: float = 1e-4) -> torch.Tensor:
+    torch.manual_seed(seed)
+    B = torch.randn(dim, dim)
+    C = torch.randn(dim, dim)
 
-    sigma = ARAI_REFERENCE_SIGMA.clone()
+    # Make diagonals non-negative (relu on diag)
+    B_diag = torch.relu(torch.diagonal(B))
+    C_diag = torch.relu(torch.diagonal(C))
+    B = B.clone()
+    C = C.clone()
+    B.diagonal().copy_(B_diag)
+    C.diagonal().copy_(C_diag)
+
+    # Make row-diagonally-dominant: set diag to sum(abs(row)) + eps
+    B_row = torch.sum(torch.abs(B), dim=-1) + epsilon
+    C_row = torch.sum(torch.abs(C), dim=-1) + epsilon
+    idx = torch.arange(dim)
+    B[idx, idx] = B_row
+    C[idx, idx] = C_row
+
+    lambd = B @ torch.inverse(C) + torch.eye(dim)
+    sigma = torch.inverse(lambd)
+    return sigma
+
+
+SIGMA_CASES = [
+    ARAI_REFERENCE_SIGMA.clone(),
+    generate_valid_sigma(ARAI_REFERENCE_SIGMA.shape[0], seed=123),
+    generate_valid_sigma(ARAI_REFERENCE_SIGMA.shape[0], seed=456),
+]
+
+
+@pytest.mark.parametrize("sigma", SIGMA_CASES)
+def test_grassmann_parity_prob_mean_cov_corr(sigma: torch.Tensor):
+    torch.manual_seed(0)
     dim = sigma.shape[0]
 
     ours = GrassmannBinary(sigma)
@@ -27,10 +59,9 @@ def test_grassmann_parity_prob_mean_cov_corr():
     assert torch.allclose(ours.corr(), ref.corr(), rtol=1e-6, atol=1e-7)
 
 
-def test_grassmann_parity_conditional_sigma():
+@pytest.mark.parametrize("sigma", SIGMA_CASES)
+def test_grassmann_parity_conditional_sigma(sigma: torch.Tensor):
     torch.manual_seed(1)
-
-    sigma = ARAI_REFERENCE_SIGMA.clone()
     dim = sigma.shape[0]
 
     ours = GrassmannBinary(sigma)
@@ -48,10 +79,9 @@ def test_grassmann_parity_conditional_sigma():
     assert torch.allclose(cs_ours, cs_ref, rtol=1e-5, atol=1e-6)
 
 
-def test_mograssmann_parity_prob_mean_cov_corr_and_conditional():
+@pytest.mark.parametrize("sigma", SIGMA_CASES)
+def test_mograssmann_parity_prob_mean_cov_corr_and_conditional(sigma: torch.Tensor):
     torch.manual_seed(2)
-
-    sigma = ARAI_REFERENCE_SIGMA.clone()
     dim = sigma.shape[0]
 
     # two identical components -> safe validity and easier parity
@@ -80,10 +110,9 @@ def test_mograssmann_parity_prob_mean_cov_corr_and_conditional():
     assert torch.allclose(cs_ours, cs_ref, rtol=1e-5, atol=1e-6)
 
 
-def test_grassmann_static_methods_equivalence():
+@pytest.mark.parametrize("sigma", SIGMA_CASES)
+def test_grassmann_static_methods_equivalence(sigma: torch.Tensor):
     torch.manual_seed(3)
-
-    sigma = ARAI_REFERENCE_SIGMA.clone()
     dim = sigma.shape[0]
 
     gb = GrassmannBinary(sigma)
@@ -111,10 +140,9 @@ def test_grassmann_static_methods_equivalence():
     assert torch.allclose(cs_from, cs_method, rtol=1e-5, atol=1e-6)
 
 
-def test_grassmann_sampling_stats():
+@pytest.mark.parametrize("sigma", SIGMA_CASES)
+def test_grassmann_sampling_stats(sigma: torch.Tensor):
     torch.manual_seed(4)
-
-    sigma = ARAI_REFERENCE_SIGMA.clone()
     gb = GrassmannBinary(sigma)
 
     n = 3000
@@ -128,10 +156,9 @@ def test_grassmann_sampling_stats():
     assert torch.allclose(emp_mean, torch.diag(sigma).float(), atol=0.05, rtol=0.0)
 
 
-def test_mograssmann_static_methods_equivalence():
+@pytest.mark.parametrize("sigma", SIGMA_CASES)
+def test_mograssmann_static_methods_equivalence(sigma: torch.Tensor):
     torch.manual_seed(5)
-
-    sigma = ARAI_REFERENCE_SIGMA.clone()
     dim = sigma.shape[0]
     sigmas = torch.stack([sigma, sigma * 0.95 + 0.05 * torch.eye(dim)], dim=0)
     mixing_p = torch.tensor([0.3, 0.7])
@@ -159,10 +186,9 @@ def test_mograssmann_static_methods_equivalence():
     assert torch.allclose(cs1, cs1_ref, rtol=1e-5, atol=1e-6)
 
 
-def test_mograssmann_sampling_stats():
+@pytest.mark.parametrize("sigma", SIGMA_CASES)
+def test_mograssmann_sampling_stats(sigma: torch.Tensor):
     torch.manual_seed(6)
-
-    sigma = ARAI_REFERENCE_SIGMA.clone()
     dim = sigma.shape[0]
     sigmas = torch.stack([sigma, sigma], dim=0)
     mixing_p = torch.tensor([0.4, 0.6])

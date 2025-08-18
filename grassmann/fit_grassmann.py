@@ -2,12 +2,12 @@ import warnings
 
 import numpy as np
 import scipy as scp
-import scipy.optimize
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.optim import Adam
 
+from grassmann.GrassmannDistribution import GrassmannBinary, MoGrassmannBinary
 from grassmann.utils import check_valid_sigma
 
 """
@@ -30,16 +30,17 @@ class EstimateGrassmannMomentMatching:
         self.dim = mean.shape[-1]
         assert cov.shape[-1] == self.dim
 
-    def construct_sigma(self, verbose=False):
+    def construct_sigma(self, verbose: bool = False):
         """
         get naive sigma estimate based on moment matching and quasi symmetric sigma
         """
         sigma = torch.diag(self.mean)
-
-        for i in range(self.dim):
-            for j in range(i):
-                sigma[i, j] = torch.abs(self.cov[i, j]) ** 0.5
-                sigma[j, i] = -sigma[i, j] * torch.sign(self.cov)[i, j]
+        # vectorized off-diagonal construction
+        abs_cov_sqrt = torch.sqrt(torch.abs(self.cov))
+        sign_cov = torch.sign(self.cov)
+        lower = torch.tril(abs_cov_sqrt, diagonal=-1)
+        upper = torch.triu((-(abs_cov_sqrt * sign_cov)).T, diagonal=1)
+        sigma = sigma + lower + upper
 
         if not (check_valid_sigma(sigma)):  # checks if the cov gives a valid sigma
             if verbose:
@@ -62,6 +63,52 @@ class EstimateGrassmannMomentMatching:
 
         self.sigma = sigma
         return sigma
+
+
+def compute_sigma_from_BC(B: Tensor, C: Tensor, epsilon: float = 1e-4) -> Tensor:
+    """
+    Shared helper to project unconstrained B, C into a valid sigma.
+    - Applies ReLU to the diagonal (non-negative)
+    - Enforces row-diagonal dominance: diag = sum(|row|) + epsilon
+    - Computes lambda = B C^{-1} + I, then sigma = lambda^{-1}
+
+    Supports inputs of shape (d,d) or batched (n,d,d).
+    """
+    if B.dim() == 2:
+        B = B.unsqueeze(0)
+        C = C.unsqueeze(0)
+
+    batch, dim, _ = B.shape
+    device = B.device
+    dtype = B.dtype
+
+    eye = torch.eye(dim, device=device, dtype=dtype).expand(batch, dim, dim)
+
+    # ReLU-diagonal
+    B_relu_diag = torch.relu(torch.diagonal(B, dim1=-1, dim2=-2))
+    C_relu_diag = torch.relu(torch.diagonal(C, dim1=-1, dim2=-2))
+    B_proj = B.clone()
+    C_proj = C.clone()
+    B_proj.diagonal(dim1=-1, dim2=-2).copy_(B_relu_diag)
+    C_proj.diagonal(dim1=-1, dim2=-2).copy_(C_relu_diag)
+
+    # Row-diagonal dominance: diag = sum(|row|) + epsilon
+    B_row_sum = torch.sum(torch.abs(B_proj), dim=-1) + epsilon
+    C_row_sum = torch.sum(torch.abs(C_proj), dim=-1) + epsilon
+    # set diagonals
+    B_proj = B_proj.clone()
+    C_proj = C_proj.clone()
+    B_proj.diagonal(dim1=-1, dim2=-2).copy_(B_row_sum)
+    C_proj.diagonal(dim1=-1, dim2=-2).copy_(C_row_sum)
+
+    # lambda = B C^{-1} + I
+    C_inv = torch.inverse(C_proj)
+    lambd = torch.matmul(B_proj, C_inv) + eye
+    sigma = torch.inverse(lambd)
+
+    if sigma.shape[0] == 1:
+        return sigma.squeeze(0)
+    return sigma
 
 
 class EstimateGrassmann(nn.Module):
@@ -89,7 +136,9 @@ class EstimateGrassmann(nn.Module):
         self.verbose = verbose
 
         if init_on_samples and samples_init is not None:
-            B_init, C_init = self.get_initial_BC(samples_init)
+            init_pair = self.get_initial_BC(samples_init)
+            if init_pair is not None:
+                B_init, C_init = init_pair
 
         # initialize parameters for grassmann
         if B_init is None:
@@ -100,9 +149,9 @@ class EstimateGrassmann(nn.Module):
         self.B = torch.nn.Parameter(data=B_init, requires_grad=True)
         self.C = torch.nn.Parameter(data=C_init, requires_grad=True)
 
-        self.sigma = self.compute_sigma(self.B, self.C)
+        self.sigma = compute_sigma_from_BC(self.B, self.C)
 
-    def get_initial_BC(self, samples, return_sigma_init=False):
+    def get_initial_BC(self, samples):
         """
         based on moment matching
         optimizing via scipy
@@ -140,18 +189,15 @@ class EstimateGrassmann(nn.Module):
 
             if not (check_valid_sigma(sigma_init)):  # checks if the sampling cov gives a valid sigma
                 warnings.warn("B,C got randomly initialized. Check if you really want to use the Grassmann framework!")
-                return None, None
+                return None
 
         BC_init = np.array(torch.rand((1, 2 * self.dim * self.dim)))
-        res = scp.optimize.minimize(self.loss_BC_init, BC_init, args=(sigma_init))
+        res = scp.optimize.minimize(self.loss_BC_init, BC_init, args=(sigma_init,))
         BC = torch.tensor(res["x"])
         B = BC.view(2, self.dim, self.dim)[0]
         C = BC.view(2, self.dim, self.dim)[1]
 
-        if return_sigma_init:
-            return B, C, sigma_init
-        else:
-            return B, C
+        return B, C
 
     def loss_BC_init(self, BC, sigma):
         """
@@ -161,64 +207,21 @@ class EstimateGrassmann(nn.Module):
         B = BC.view(2, self.dim, self.dim)[0]
         C = BC.view(2, self.dim, self.dim)[1]
         s_est = self.compute_sigma(B, C)
-        l = torch.dist(sigma, s_est)
-        return np.array(l)
+        loss_value = torch.dist(sigma, s_est)
+        return np.array(loss_value)
 
     def compute_sigma(self, B, C):
         """
-        Relu on diag such that b_ii and c_ii > 0
-        calculates b_new_ii = b_ii + sum_{i \neq j} b_ij, same for C
+        Compute sigma from unconstrained B, C using a stable, vectorized projection.
+        Delegates to module-level helper to allow reuse across classes.
         """
-        # apply relu to diagonal elements of B and C
-        mask = torch.ones((self.dim, self.dim)) - torch.eye((self.dim))
-        B_ = B * mask + torch.eye(self.dim) * F.relu(torch.diag(B))  # torch.exp
-        C_ = C * mask + torch.eye(self.dim) * F.relu(torch.diag(C))
+        return compute_sigma_from_BC(B, C)
 
-        # make it row diagonal dominant
-        B_ = B_ + torch.eye(self.dim) * (torch.sum(torch.abs(B_), 1) - torch.diag(B_))
-        C_ = C_ + torch.eye(self.dim) * (torch.sum(torch.abs(C_), 1) - torch.diag(C_))
-
-        lambd = B_ @ torch.inverse(C_) + torch.eye(self.dim)  # BC**-1 + I (80)
-
-        sigma = torch.inverse(lambd)
-
-        # apply clip for stable training
-        # sigma = torch.clip(sigma,min=-0.99, max=0.99)*mask + torch.eye(self.dim)*torch.clip(torch.diag(sigma),min=0,max=0.9)
-
-        return sigma
-
-    def prob_grassmann(
-        self,
-        x: Tensor,
-        sigma: Tensor,
-    ) -> Tensor:  # n x d  # (d x d)
+    def prob_grassmann(self, x: Tensor, sigma: Tensor) -> Tensor:
         """
-        Return the probability of `x` under a GrassmannBinary with specified parameters.
-        Args:
-            x: Location at which to evaluate the Grassmann, aka binary vector.
-            sigma: (d x d)
-        Returns:
-            Log-probabilities of each input.
+        Thin wrapper that reuses GrassmannBinary.prob_grassmann for parity.
         """
-        assert len(x.shape) == 2  # check dim: batch, d
-
-        batch_size = x.shape[0]
-        dim = sigma.shape[0]
-
-        m = torch.zeros((batch_size, dim, dim))
-
-        # vectorized version
-        m = sigma.repeat(batch_size, 1, 1) * ((-1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
-        m = m * (1 - torch.eye(dim, dim).repeat(batch_size, 1, 1))  # replace diag with 0
-        m = m + (
-            torch.eye(dim).repeat(batch_size, 1, 1)
-            * (torch.diag(sigma).repeat(batch_size, 1) ** x).repeat(1, dim).view(batch_size, dim, dim)
-            * (torch.diag(1 - sigma).repeat(batch_size, 1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
-        )
-
-        p = torch.det(m)
-
-        return p
+        return GrassmannBinary.prob_grassmann(x, sigma)
 
     def forward(self, x):
         """Network forward pass.
@@ -271,21 +274,22 @@ class EstimateMoGrassmann(nn.Module):
         p_mixing_init = torch.rand(self.nc)
 
         if init_on_samples and samples_init is not None:
-            B_init1, C_init1 = self.get_initial_BC(samples_init)
-            for i in range(nc):
-                B_init[i] = B_init1 + torch.randn((self.dim, self.dim)) * 1e-10
-                C_init[i] = C_init1 + torch.randn((self.dim, self.dim)) * 1e-10
+            init_pair = self.get_initial_BC(samples_init, return_sigma_init=False)
+            if init_pair is not None and init_pair[0] is not None and init_pair[1] is not None:
+                B_init1, C_init1 = init_pair[:2]
+                for i in range(nc):
+                    B_init[i] = B_init1 + torch.randn((self.dim, self.dim)) * 1e-10
+                    C_init[i] = C_init1 + torch.randn((self.dim, self.dim)) * 1e-10
 
         self.B = torch.nn.Parameter(data=B_init, requires_grad=True)
         self.C = torch.nn.Parameter(data=C_init, requires_grad=True)
         self.p_mixing_un = torch.nn.Parameter(data=p_mixing_init, requires_grad=True)
         self.p_mixing = F.softmax(self.p_mixing_un, dim=0)
 
-        self.sigma = torch.zeros((self.nc, self.dim, self.dim))
-        for i in range(nc):
-            self.sigma[i] = self.compute_sigma1(self.B[i], self.C[i])
+        # vectorized batched sigma projection
+        self.sigma = compute_sigma_from_BC(self.B, self.C)
 
-    def get_initial_BC(self, samples, return_sigma_init=False):
+    def get_initial_BC(self, samples, return_sigma_init: bool = False):
         """
         based on moment matching
         optimizing via scipy
@@ -326,15 +330,14 @@ class EstimateMoGrassmann(nn.Module):
                 return None, None
 
         BC_init = np.array(torch.rand((1, 2 * self.dim * self.dim)))
-        res = scp.optimize.minimize(self.loss_BC_init, BC_init, args=(sigma_init))
+        res = scp.optimize.minimize(self.loss_BC_init, BC_init, args=(sigma_init,))
         BC = torch.tensor(res["x"])
         B = BC.view(2, self.dim, self.dim)[0]
         C = BC.view(2, self.dim, self.dim)[1]
 
         if return_sigma_init:
             return B, C, sigma_init
-        else:
-            return B, C
+        return B, C
 
     def loss_BC_init(self, BC, sigma):
         """
@@ -344,85 +347,20 @@ class EstimateMoGrassmann(nn.Module):
         B = BC.view(2, self.dim, self.dim)[0]
         C = BC.view(2, self.dim, self.dim)[1]
         s_est = self.compute_sigma1(B, C)
-        l = torch.dist(sigma, s_est)
-        return np.array(l)
+        loss_value = torch.dist(sigma, s_est)
+        return np.array(loss_value)
 
     def compute_sigma1(self, B, C):
-        """
-        Relu on diag such that b_ii and c_ii > 0
-        calculates b_new_ii = b_ii + sum_{i \neq j} b_ij, same for C
-        """
-        # apply relu to diagonal elements of B and C
-        mask = torch.ones((self.dim, self.dim)) - torch.eye((self.dim))
-        B_ = B * mask + torch.eye(self.dim) * F.relu(torch.diag(B))  # torch.exp
-        C_ = C * mask + torch.eye(self.dim) * F.relu(torch.diag(C))
-
-        # make it row diagonal dominant
-        B_ = B_ + torch.eye(self.dim) * (torch.sum(torch.abs(B_), 1) - torch.diag(B_))
-        C_ = C_ + torch.eye(self.dim) * (torch.sum(torch.abs(C_), 1) - torch.diag(C_))
-
-        lambd = B_ @ torch.inverse(C_) + torch.eye(self.dim)  # BC**-1 + I (80)
-
-        sigma = torch.inverse(lambd)
-
-        return sigma
+        """Backward-compat alias to the shared projection."""
+        return compute_sigma_from_BC(B, C)
 
     def compute_sigma(self, B, C):
-        """
-        Relu on diag such that b_ii and c_ii > 0
-        calculates b_new_ii = b_ii + sum_{i \neq j} b_ij, same for C
-        """
-        sigma = torch.zeros(B.shape)
-        for i in range(self.nc):
-            # apply relu to diagonal elements of B and C
-            mask = torch.ones((self.dim, self.dim)) - torch.eye((self.dim))
-            B_ = B[i] * mask + torch.eye(self.dim) * F.relu(torch.diag(B[i]))  # torch.exp
-            C_ = C[i] * mask + torch.eye(self.dim) * F.relu(torch.diag(C[i]))
+        """Vectorized batched projection for MoGrassmann."""
+        return compute_sigma_from_BC(B, C)
 
-            # make it row diagonal dominant
-            B_ = B_ + torch.eye(self.dim) * (torch.sum(torch.abs(B_), 1) - torch.diag(B_))
-            C_ = C_ + torch.eye(self.dim) * (torch.sum(torch.abs(C_), 1) - torch.diag(C_))
-
-            lambd = B_ @ torch.inverse(C_) + torch.eye(self.dim)  # BC**-1 + I (80)
-
-            sigma[i] = torch.inverse(lambd)
-
-        return sigma
-
-    def prob_mograssmann(
-        self,
-        x: Tensor,
-        sigma: Tensor,
-        p_mixing: Tensor,  # n x d  # (nc, d x d)  # (nc)
-    ) -> Tensor:
-        """
-        Return the probability of `x` under a GrassmannBinary with specified parameters.
-        Args:
-            x: Location at which to evaluate the Grassmann, aka binary vector.
-            sigma: (d x d)
-        Returns:
-            Log-probabilities of each input.
-        """
-
-        assert len(x.shape) == 2  # check dim: batch, dim
-
-        batch_size = x.shape[0]
-        dim = x.shape[-1]
-        num_components = p_mixing.shape[0]
-
-        diag_mask = torch.eye(dim).repeat(batch_size, num_components, 1, 1)
-
-        m = sigma * ((-1) ** (1 - x)).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
-        m = m * (1 - diag_mask)  # replace diag with 0
-        m = m + (
-            (diag_mask * sigma) ** x.repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
-            * (diag_mask * (1 - sigma))
-            ** (1 - x).repeat(1, num_components * dim).view(batch_size, num_components, dim, dim)
-        )
-
-        p = (p_mixing * torch.det(m)).sum(-1)
-
-        return p
+    def prob_mograssmann(self, x: Tensor, sigma: Tensor, p_mixing: Tensor) -> Tensor:
+        """Reuse the distribution's mixture probability."""
+        return MoGrassmannBinary.prob_mograssmann(x, p_mixing, sigma)
 
     def forward(self, x):
         """Network forward pass.
@@ -435,7 +373,6 @@ class EstimateMoGrassmann(nn.Module):
         assert self.dim == x.shape[1]
 
         self.sigma = self.compute_sigma(self.B, self.C)
-
         self.p_mixing = F.softmax(self.p_mixing_un, dim=0)
         p = self.prob_mograssmann(x, self.sigma, self.p_mixing)
 
@@ -487,7 +424,6 @@ def train_EstimateGrassmann(
         logprob = model(_x)
 
         loss = -logprob
-        # loss.requires_grad = True
 
         loss.backward()
 

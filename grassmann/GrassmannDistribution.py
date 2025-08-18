@@ -277,10 +277,7 @@ class MoGrassmannBinary:
         """
         returns the expected value based on self.sigma
         """
-        return torch.sum(
-            torch.diagonal(self.sigma, dim1=-1, dim2=-2) * self.mixing_p.unsqueeze(-1),
-            -2,
-        )
+        return torch.sum(torch.diagonal(self.sigma, dim1=-1, dim2=-2) * self.mixing_p.unsqueeze(-1), -2)
 
     @staticmethod
     def cov_mograssmann(mixing_p, sigma) -> Tensor:
