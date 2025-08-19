@@ -32,35 +32,37 @@ class GrassmannBinary:
     def prob_grassmann(
         x: Tensor,
         sigma: Tensor,
-    ) -> Tensor:  # n x d  # (d x d)
+    ) -> Tensor:
         """
         Return the probability of `x` under a GrassmannBinary with specified parameters.
-        As standalone method.
+        This implementation supports an arbitrary number of batch dimensions.
+
         Args:
-            x: Location at which to evaluate the Grassmann, aka binary vector.
-            sigma:
+            x: Binary inputs with shape (..., d).
+            sigma: Grassmann parameter with shape (..., d, d) or (d, d), broadcastable to x.
         Returns:
-            probabilities of each input.
+            probabilities with shape broadcast(x.shape[:-1], sigma.shape[:-2]).
         """
-        assert len(x.shape) == 2  # check dim: batch, d
+        # Validate last dimensions
+        assert x.shape[-1] == sigma.shape[-1] == sigma.shape[-2]
 
-        batch_size = x.shape[0]
-        dim = sigma.shape[0]
+        dim = sigma.shape[-1]
 
-        m = torch.zeros((batch_size, dim, dim))
+        # Off-diagonal part: multiply each column j by (-1)^(1 - x_j) which is -1 if x_j=0 else 1
+        # Use a stable equivalent: sign = 2*x - 1  in { -1, 1 }
+        sign = 2 * x - 1  # (..., d)
+        off_diag = sigma * sign[..., None, :]  # (..., d, d)
 
-        # vectorized version
-        m = sigma.repeat(batch_size, 1, 1) * ((-1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
-        m = m * (1 - torch.eye(dim, dim).repeat(batch_size, 1, 1))  # replace diag with 0
-        m = m + (
-            torch.eye(dim).repeat(batch_size, 1, 1)
-            * (torch.diag(sigma).repeat(batch_size, 1) ** x).repeat(1, dim).view(batch_size, dim, dim)
-            * (torch.diag(1 - sigma).repeat(batch_size, 1) ** (1 - x)).repeat(1, dim).view(batch_size, dim, dim)
-        )
+        eye = torch.eye(dim, dtype=sigma.dtype, device=sigma.device)
+        off_diag = off_diag * (1 - eye)  # zero diagonal
 
-        p = torch.det(m)
+        # Diagonal part: sigma_ii^x_i * (1 - sigma_ii)^(1 - x_i) reduces to x*sigma_ii + (1-x)*(1-sigma_ii)
+        diag_sigma = torch.diagonal(sigma, dim1=-2, dim2=-1)  # (..., d)
+        diag_val = x * diag_sigma + (1 - x) * (1 - diag_sigma)  # (..., d)
 
-        return p
+        m = off_diag + torch.diag_embed(diag_val)  # (..., d, d)
+
+        return torch.linalg.det(m)  # (...)
 
     def mean(self):
         """
@@ -71,18 +73,18 @@ class GrassmannBinary:
     @staticmethod
     def cov_grassmann(sigma):
         """
-        calculates the cov a a grassmann distribution
+        calculates the covariance for a Grassmann distribution.
         Args:
-            sigma (Tensor): parameter of gr
+            sigma (Tensor): Grassmann parameter with shape (..., d, d)
 
         Returns:
-            Tensor: cov
+            Tensor: covariance with shape (..., d, d)
         """
         # off-diagonal: -sigma_ij * sigma_ji
-        cov = -(sigma * sigma.T)
+        cov = -(sigma * sigma.transpose(-1, -2))
         # diagonal: p * (1 - p), where p = diag(sigma)
-        diag = torch.diagonal(sigma)
-        cov.diagonal().copy_(diag * (1 - diag))
+        diag = torch.diagonal(sigma, dim1=-2, dim2=-1)
+        cov.diagonal(dim1=-2, dim2=-1).copy_(diag * (1 - diag))
         return cov
 
     def cov(self):
@@ -253,25 +255,25 @@ class MoGrassmannBinary:
     ) -> Tensor:
         """
         Return the probability of `inputs` under a MoGrassmann with specified parameters.
-        Unlike the `prob()` method, this method is fully detached from the neural
-        network and can be used independent of the neural net in case the MoGrassmann
-        parameters are already known.
+        Supports arbitrary leading batch dimensions shared/broadcast across arguments.
+
         Args:
-            inputs: 01-tensors at which to evaluate the MoGrassmann. (batch_size, parameter_dim)
-            mixing_p: weights of each component of the MoGrassmann. Shape: (num_components).
-            sigmas: Parameters of each MoGrassmann, shape (num_components, parameter_dim, parameter_dim).
+            inputs: 01-tensors at which to evaluate the MoGrassmann. Shape (..., d).
+            mixing_p: Weights for each mixture component. Shape (..., n_components).
+            sigmas: MoGrassmann parameters. Shape (..., n_components, d, d).
         Returns:
-            probabilities of each input.
+            probabilities with shape broadcast(inputs.shape[:-1], mixing_p.shape[:-1], sigmas.shape[:-3]).
         """
-        assert len(inputs.shape) == 2  # check dim: batch, dim
-        assert sigmas.shape[0] == mixing_p.shape[0]  # check: n_components
+        # Basic shape checks on the trailing dimensions
+        d = inputs.shape[-1]
+        assert sigmas.shape[-1] == d and sigmas.shape[-2] == d
+        assert mixing_p.shape[-1] == sigmas.shape[-3]
 
-        num_components = mixing_p.shape[0]
+        # Compute per-component probabilities, broadcasting inputs across the component axis
+        per_component = GrassmannBinary.prob_grassmann(inputs.unsqueeze(-2), sigmas)  # (..., K)
 
-        # Reuse single-component probability and sum across components
-        per_comp = [GrassmannBinary.prob_grassmann(inputs, sigmas[k]) for k in range(num_components)]
-        probs = torch.stack(per_comp, dim=-1)  # (batch_size, num_components)
-        return probs @ mixing_p
+        # Weighted sum across components
+        return torch.sum(per_component * mixing_p, dim=-1)
 
     def mean(self):
         """
@@ -282,35 +284,31 @@ class MoGrassmannBinary:
     @staticmethod
     def cov_mograssmann(mixing_p, sigma) -> Tensor:
         """
-        computes the cov for the given mixing coefficients and sigma
-        as standalone
-        returns:
-            mixing_p (n_components)
-            cov (dim,dim)
+        Computes the covariance for a mixture for the given mixing coefficients and parameters.
+        Supports arbitrary leading batch dimensions.
+
+        Args:
+            mixing_p: (..., n_components)
+            sigma: (..., n_components, d, d)
+        Returns:
+            cov: (..., d, d)
         """
-        # get dims
+        # Basic shape checks on the trailing dimensions
         n_comp = mixing_p.shape[-1]
+        assert sigma.shape[-3] == n_comp
 
-        assert sigma.shape[0] == n_comp
-        # check if mixing coefficients sum up to 1
-        assert torch.isclose(torch.sum(mixing_p), torch.ones(1), atol=1e-4)
+        # Means per component (..., K, d)
+        means = torch.diagonal(sigma, dim1=-1, dim2=-2)
 
-        # Means per component
-        means = torch.diagonal(sigma, dim1=-1, dim2=-2)  # (n_comp, dim)
+        # Within-component covariance (..., K, d, d)
+        cov_per_comp = GrassmannBinary.cov_grassmann(sigma)
+        cov_within = torch.sum(cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), dim=-3)
 
-        # Reuse GrassmannBinary.cov_grassmann per component
-        cov_per_comp = torch.stack(
-            [GrassmannBinary.cov_grassmann(sigma[k]) for k in range(n_comp)], dim=0
-        )  # (n_comp, dim, dim)
-
-        # Weighted within-component covariance
-        cov_within = torch.sum(cov_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), dim=0)
-
-        # Mixture mean and between-component covariance
-        mixture_mean = torch.sum(means * mixing_p.unsqueeze(-1), dim=0)  # (dim)
-        diffs = means - mixture_mean  # (n_comp, dim)
-        cov_of_means_per_comp = torch.einsum("ni,nj->nij", diffs, diffs)
-        cov_between = torch.sum(cov_of_means_per_comp * mixing_p.unsqueeze(-1).unsqueeze(-1), dim=0)
+        # Between-component covariance
+        mixture_mean = torch.sum(means * mixing_p.unsqueeze(-1), dim=-2)  # (..., d)
+        diffs = means - mixture_mean.unsqueeze(-2)  # (..., K, d)
+        weighted_diffs = diffs * mixing_p.unsqueeze(-1)  # (..., K, d)
+        cov_between = torch.einsum("...kd,...ke->...de", weighted_diffs, diffs)
 
         return cov_within + cov_between
 
@@ -335,17 +333,17 @@ class MoGrassmannBinary:
     @staticmethod
     def corr_mograssmann(mixing_p, sigma) -> Tensor:
         """
-        computes the corr
+        computes the correlation matrix, supporting arbitrary leading batch dimensions.
         inputs:
-            mixing_p (batch,n_components)
-            sigma (num_components, dim, dim)
+            mixing_p (..., n_components)
+            sigma (..., n_components, dim, dim)
         returns:
-            cov (batch,dim,dim)
+            corr (..., dim, dim)
         """
         # compute cov, including all components
         cov = MoGrassmannBinary.cov_mograssmann(mixing_p, sigma)
-        std = torch.sqrt(torch.diagonal(cov, dim1=-1, dim2=-2))
-        std_mat = torch.outer(std, std)
+        std = torch.sqrt(torch.diagonal(cov, dim1=-1, dim2=-2))  # (..., d)
+        std_mat = std.unsqueeze(-1) * std.unsqueeze(-2)  # (..., d, d)
         return cov / (std_mat + 1e-8)
 
     def conditional_sigma(self, sigma: Tensor, xc: Tensor) -> Tensor:

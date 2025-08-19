@@ -93,7 +93,6 @@ def test_sample_shapes_and_values():
     model = GrassmannConditional(features, hidden_features, hidden, num_components=2)
 
     context = torch.randn(1, 7)
-    mixing_p, sigma = model.get_grassmann_params(context)
     samples = model.sample(500, context)
     assert samples.shape == (500, features)
     assert torch.all((samples == 0) | (samples == 1))

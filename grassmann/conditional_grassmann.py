@@ -94,7 +94,6 @@ class GrassmannConditional(nn.Module):
         computes the means for the given context
         """
         mixing_p, sigma = self.get_grassmann_params(context)
-
         return torch.sum(torch.diagonal(sigma, dim1=-1, dim2=-2) * mixing_p.unsqueeze(-1), -2)
 
     def cov(self, context: Tensor) -> Tensor:
@@ -105,14 +104,7 @@ class GrassmannConditional(nn.Module):
         """
         # get sigmas
         mixing_p, sigma = self.get_grassmann_params(context)
-
-        return self.cov_mograssmann(mixing_p, sigma)
-
-    @staticmethod
-    def cov_mograssmann(mixing_p, sigma) -> Tensor:
-        """Batched wrapper around base mixture covariance."""
-        batch = mixing_p.shape[0]
-        return torch.stack([MoGrassmannBinary.cov_mograssmann(mixing_p[b], sigma[b]) for b in range(batch)], dim=0)
+        return MoGrassmannBinary.cov_mograssmann(mixing_p, sigma)
 
     def corr(self, context: Tensor) -> Tensor:
         """
@@ -120,28 +112,8 @@ class GrassmannConditional(nn.Module):
         returns:
             corr (batch,dim,dim)
         """
-
         mixing_p, sigma = self.get_grassmann_params(context)
-
-        corr = self.corr_mograssmann(mixing_p, sigma)
-
-        return corr
-
-    @staticmethod
-    def corr_mograssmann(mixing_p, sigma) -> Tensor:
-        """
-        computes the corr
-        inputs:
-            mixing_p (batch,n_components)
-            sigma (batch,num_components, dim, dim)
-        returns:
-            cov (batch,dim,dim)
-        """
-        # compute cov, including all components
-        cov = GrassmannConditional.cov_mograssmann(mixing_p, sigma)
-        std = torch.sqrt(torch.diagonal(cov, dim1=-1, dim2=-2))
-        std_mat = torch.einsum("bi,bj->bij", (std, std))  # batchwise outer product
-        return cov / (std_mat + 1e-8)
+        return MoGrassmannBinary.corr_mograssmann(mixing_p, sigma)
 
     def compute_sigma(self, B: Tensor, C: Tensor) -> Tensor:
         """
@@ -184,12 +156,8 @@ class GrassmannConditional(nn.Module):
 
     @staticmethod
     def prob_mograssmann(inputs: Tensor, mixing_p: Tensor, sigmas: Tensor) -> Tensor:
-        """Batched wrapper around base mixture probability."""
-        batch = inputs.shape[0]
-        return torch.stack([
-            MoGrassmannBinary.prob_mograssmann(inputs[b : b + 1], mixing_p[b], sigmas[b]).squeeze(0)
-            for b in range(batch)
-        ])
+        """Vectorized probability via base batched implementation."""
+        return MoGrassmannBinary.prob_mograssmann(inputs, mixing_p, sigmas)
 
     def sample(self, num_samples: int, context: Tensor) -> Tensor:
         """
